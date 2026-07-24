@@ -11,11 +11,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-APP_VERSION = "0.32.0"
+APP_VERSION = "0.33.0"
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageEnhance, ImageOps
-
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageOps
 
 
 from PyQt6.QtCore import Qt, QTimer
@@ -26,7 +25,6 @@ from PyQt6.QtWidgets import (
     QLabel, QMainWindow, QMessageBox, QPushButton, QProgressDialog,
     QScrollArea, QSlider, QSpinBox, QSplashScreen, QStyle, QTabWidget, QVBoxLayout, QWidget
 )
-
 
 
 def set_windows_app_user_model_id():
@@ -66,6 +64,8 @@ class Settings:
     spiral_center_y: float = 50.0
     spiral_clockwise: bool = True
     spiral_smoothing: int = 6
+    wave_cycles: float = 2.75
+    wave_amplitude: float = 0.45
 
 
 class ImageView(QScrollArea):
@@ -121,7 +121,6 @@ def center_square(image: Image.Image) -> Image.Image:
 
 
 def framed_source(image: Image.Image, settings: Settings) -> Image.Image:
-    """Interactive framing: rotation, zoom, pan and crop-ratio presets."""
     image = ImageOps.exif_transpose(image).convert("RGB")
     if abs(settings.rotation) > 1e-6:
         image = image.rotate(
@@ -152,7 +151,7 @@ def framed_source(image: Image.Image, settings: Settings) -> Image.Image:
     top = int(round(max(0, min(height - crop_h, cy - crop_h / 2))))
     crop = image.crop((left, top, int(left + crop_w), int(top + crop_h)))
 
-                                                                                     
+
     return ImageOps.pad(
         crop,
         (settings.output_size, settings.output_size),
@@ -184,7 +183,7 @@ def smooth_1d(values: np.ndarray, radius: int = 6) -> np.ndarray:
 
 
 def choose_pattern(image: Image.Image) -> str:
-                                                                       
+
     gray = np.asarray(center_square(image).convert("L").resize((192, 192)),
                       dtype=np.float32) / 255.0
     detail = (np.abs(np.diff(gray, axis=0)).mean()
@@ -228,8 +227,156 @@ def render_axis_stripes(image: Image.Image, settings: Settings, horizontal: bool
     return result.transpose(Image.Transpose.ROTATE_270) if horizontal else result
 
 
+def render_segmented_scanlines(image: Image.Image, settings: Settings) -> Image.Image:
+    arr = rgb_array(image)
+    size = settings.output_size
+    rows = max(6, int(settings.density))
+    row_step = size / rows
+    column_step = max(3.0, row_step * 0.52)
+    columns = max(1, int(math.ceil(size / column_step)))
+    x_centres = (np.arange(columns, dtype=np.float32) + 0.5) * column_step
+    x_axis = np.arange(size, dtype=np.float32)
+
+    masks = [Image.new("L", (size, size), 0) for _ in range(3)]
+    draws = [ImageDraw.Draw(mask) for mask in masks]
+    separation = min(float(settings.colour_separation), column_step * 0.95)
+    shifts = (-separation, 0.0, separation)
+    dash_width = max(1.0, column_step * 0.72)
+    minimum_height = max(1.0, row_step * 0.018)
+    maximum_height = max(minimum_height + 1.0, row_step * 0.88)
+
+    for row in range(rows):
+        centre_y = (row + 0.5) * row_step
+        sample_half_height = row_step * 0.38
+        y0 = max(0, int(math.floor(centre_y - sample_half_height)))
+        y1 = min(size, int(math.ceil(centre_y + sample_half_height)) + 1)
+        if y1 <= y0:
+            continue
+
+        values = arr[y0:y1, :, :].mean(axis=0)
+        for channel in range(3):
+            values[:, channel] = smooth_1d(
+                values[:, channel], settings.line_smoothing
+            )
+
+        sampled = np.stack(
+            [
+                np.interp(
+                    x_centres,
+                    x_axis,
+                    values[:, channel],
+                    left=0.0,
+                    right=0.0
+                )
+                for channel in range(3)
+            ],
+            axis=1
+        )
+        heights = minimum_height + (maximum_height - minimum_height) * np.clip(
+            np.power(sampled, 0.82) * settings.strength,
+            0.0,
+            1.0
+        )
+
+        for channel, shift in enumerate(shifts):
+            draw = draws[channel]
+            for column, centre_x in enumerate(x_centres):
+                height = float(heights[column, channel])
+                shifted_x = float(centre_x + shift)
+                draw.rectangle(
+                    (
+                        shifted_x - dash_width / 2.0,
+                        centre_y - height / 2.0,
+                        shifted_x + dash_width / 2.0,
+                        centre_y + height / 2.0
+                    ),
+                    fill=255
+                )
+
+    channels = [np.asarray(mask, dtype=np.uint8) for mask in masks]
+    return Image.fromarray(np.stack(channels, axis=2), "RGB")
+
+
+def render_wavy_lines(image: Image.Image, settings: Settings) -> Image.Image:
+    size = settings.output_size
+    count = max(6, int(settings.density))
+    spacing = size / count
+
+    blur_radius = max(1.0, spacing * 0.22)
+    softened = image.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+    arr = rgb_array(softened)
+
+    sample_step = max(2, int(round(size / 800)))
+    y = np.arange(0, size, sample_step, dtype=np.float32)
+    if not len(y) or y[-1] != size - 1:
+        y = np.append(y, np.float32(size - 1))
+    yi = np.clip(np.rint(y).astype(np.int32), 0, size - 1)
+
+    cycles = max(0.0, float(settings.wave_cycles))
+    carrier = (
+        spacing
+        * float(settings.wave_amplitude)
+        * np.sin(2.0 * math.pi * cycles * y / max(1.0, size - 1.0))
+    )
+    image_amplitude = spacing * 1.25 * settings.strength
+    maximum_displacement = spacing * 0.75
+
+    masks = [Image.new("L", (size, size), 0) for _ in range(3)]
+    draws = [ImageDraw.Draw(mask) for mask in masks]
+    separation = min(float(settings.colour_separation), spacing * 0.85)
+    offsets = (-separation, 0.0, separation)
+    minimum_width = max(1.0, spacing * 0.018)
+    maximum_width = max(minimum_width + 1.0, spacing * 0.38)
+
+    for line_index in range(count):
+        base_x = (line_index + 0.5) * spacing
+        sample_half_width = spacing * 0.44
+        x0 = max(0, int(math.floor(base_x - sample_half_width)))
+        x1 = min(size, int(math.ceil(base_x + sample_half_width)) + 1)
+        if x1 <= x0:
+            continue
+
+        values = arr[yi, x0:x1, :].mean(axis=1)
+        for channel in range(3):
+            values[:, channel] = smooth_1d(
+                values[:, channel], settings.line_smoothing * 2
+            )
+        local_luminance = luminance(values)
+        local_luminance = smooth_1d(
+            local_luminance, settings.line_smoothing * 2
+        )
+        displacement = np.clip(
+            image_amplitude * (local_luminance - 0.5),
+            -maximum_displacement,
+            maximum_displacement
+        )
+        centre_line = base_x + carrier + displacement
+
+        widths = minimum_width + (maximum_width - minimum_width) * np.clip(
+            np.power(values, 0.82) * settings.strength,
+            0.0,
+            1.0
+        )
+
+        for channel, offset in enumerate(offsets):
+            draw = draws[channel]
+            x = centre_line + offset
+            previous = (float(x[0]), float(y[0]))
+            for index in range(1, len(y)):
+                current = (float(x[index]), float(y[index]))
+                width = max(
+                    1,
+                    int(round(float((widths[index - 1, channel] + widths[index, channel]) / 2.0)))
+                )
+                draw.line((previous, current), fill=255, width=width)
+                previous = current
+
+    channels = [np.asarray(mask, dtype=np.uint8) for mask in masks]
+    return Image.fromarray(np.stack(channels, axis=2), "RGB")
+
+
 def render_diagonal_stripes(image: Image.Image, settings: Settings) -> Image.Image:
-                                                                                    
+
     size = settings.output_size
     enlarged = int(math.ceil(size * math.sqrt(2)))
     canvas = Image.new("RGB", (enlarged, enlarged), "black")
@@ -342,7 +489,7 @@ def render_rings(image: Image.Image, settings: Settings) -> Image.Image:
 
 
 def render_crosshatch(image: Image.Image, settings: Settings) -> Image.Image:
-                                                                              
+
     arr = rgb_array(image)
     size = settings.output_size
     cells = max(12, int(settings.density * 2.2))
@@ -382,7 +529,7 @@ def render_crosshatch(image: Image.Image, settings: Settings) -> Image.Image:
 
 
 def render_truchet(image: Image.Image, settings: Settings) -> Image.Image:
-                                                                                        
+
     arr = rgb_array(image)
     size = settings.output_size
     cells = max(10, int(settings.density * 1.8))
@@ -422,7 +569,6 @@ def render_truchet(image: Image.Image, settings: Settings) -> Image.Image:
     return output
 
 
-
 def _spiral_geometry(size: int, turns: int, settings: Settings):
     cx = (size - 1) * settings.spiral_center_x / 100.0
     cy = (size - 1) * settings.spiral_center_y / 100.0
@@ -452,7 +598,6 @@ def _spiral_geometry(size: int, turns: int, settings: Settings):
 
 
 def _smooth_along_path(values: np.ndarray, point_count: int, turns: int, settings: Settings) -> np.ndarray:
-    """Smooth local values along the spiral while retaining recognizable detail."""
     smooth_radius = max(
         1,
         int(round(
@@ -484,18 +629,6 @@ def render_spiral_halftone(
     image: Image.Image,
     settings: Settings
 ) -> Image.Image:
-    """
-    One continuous spiral using exactly the same colour logic as the line modes.
-
-    Three independent spiral strokes are rendered into separate red, green and
-    blue channel masks. Their local widths are calculated independently from
-    the corresponding source channel. The strokes are shifted across the normal
-    by Colour separation.
-
-    Where the three channel strokes overlap, the additive result is white.
-    Partial overlap naturally produces yellow, cyan and magenta, reproducing the
-    same white-centred RGB fringes as the diagonal, horizontal and vertical lines.
-    """
     arr = rgb_array(image)
     size = settings.output_size
     turns = max(12, int(round(settings.density * 2.15)))
@@ -514,15 +647,14 @@ def render_spiral_halftone(
         0.0, 1.0
     )
 
-                                                              
+
     separation = min(
         float(settings.colour_separation),
         turn_spacing * 0.95
     )
     offsets = (-separation, 0.0, separation)
 
-                                                                               
-                                                                              
+
     masks = [Image.new("L", (size, size), 0) for _ in range(3)]
     draws = [ImageDraw.Draw(mask) for mask in masks]
 
@@ -544,7 +676,7 @@ def render_spiral_halftone(
             pixel_width = max(1, int(round(float(widths[index, channel]))))
             draws[channel].line((p0, p1), fill=255, width=pixel_width)
 
-                                                                                
+
             joint_radius = pixel_width / 2.0
             draws[channel].ellipse(
                 (
@@ -572,6 +704,10 @@ def generate(image: Image.Image, settings: Settings) -> tuple[Image.Image, str]:
         result = render_axis_stripes(prepared, settings, horizontal=True)
     elif pattern == "Diagonal stripes":
         result = render_diagonal_stripes(prepared, settings)
+    elif pattern == "Segmented scanlines":
+        result = render_segmented_scanlines(prepared, settings)
+    elif pattern == "Wavy lines":
+        result = render_wavy_lines(prepared, settings)
     elif pattern == "Halftone":
         result = render_halftone(prepared, settings, hexagonal=False)
     elif pattern == "Hexagonal halftone":
@@ -582,7 +718,6 @@ def generate(image: Image.Image, settings: Settings) -> tuple[Image.Image, str]:
         result = render_axis_stripes(prepared, settings, horizontal=False)
 
     return result, pattern
-
 
 
 class ExportDialog(QDialog):
@@ -650,6 +785,24 @@ PATTERN_PARAMETER_PROFILES = {
         "animation_end": 28,
         "tooltip": "Approximate number of diagonal stripes crossing the output."
     },
+    "Segmented scanlines": {
+        "label": "Number of scanlines",
+        "minimum": 6,
+        "maximum": 240,
+        "default": 20,
+        "animation_start": 16,
+        "animation_end": 52,
+        "tooltip": "Total number of horizontal rows made of discrete RGB dashes."
+    },
+    "Wavy lines": {
+        "label": "Number of lines",
+        "minimum": 6,
+        "maximum": 240,
+        "default": 28,
+        "animation_start": 16,
+        "animation_end": 46,
+        "tooltip": "Total number of vertical RGB lines deformed by the source image."
+    },
     "Halftone": {
         "label": "Dot spacing",
         "minimum": 3,
@@ -710,7 +863,6 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, self.fit_window_width)
 
     def fit_window_width(self):
-        """Fit the window to the actual horizontal content without extra blank space."""
         target = 1125
         screen = QApplication.primaryScreen()
         if screen is not None:
@@ -867,8 +1019,9 @@ class MainWindow(QMainWindow):
 
             <p><b>2. Brightness is converted into geometry.</b><br>
             Instead of drawing normal pixels, Percepta changes the width of stripes,
-            the size of dots, or the thickness of a spiral. Bright areas contain more
-            visible coloured material; dark areas contain less.</p>
+            the height of segmented dashes, the displacement and thickness of wavy
+            lines, the size of dots, or the thickness of a spiral. Bright areas contain
+            more visible coloured material; dark areas contain less.</p>
 
             <p><b>3. The three colour channels are drawn separately.</b><br>
             Red, green and blue versions of the same pattern are slightly displaced.
@@ -919,7 +1072,7 @@ class MainWindow(QMainWindow):
         layout = QHBoxLayout(root)
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(8)
-        
+
         panel = QWidget()
         panel.setFixedWidth(280)
         panel_layout = QVBoxLayout(panel)
@@ -953,6 +1106,8 @@ class MainWindow(QMainWindow):
             "Vertical stripes",
             "Horizontal stripes",
             "Diagonal stripes",
+            "Segmented scanlines",
+            "Wavy lines",
             "Halftone",
             "Hexagonal halftone",
             "Spiral stripes"
@@ -1047,6 +1202,22 @@ class MainWindow(QMainWindow):
         self.line_smoothing.setValue(6)
         lines_form.addRow("Smoothing", self.line_smoothing)
 
+        self.wave_box = QGroupBox("Wavy lines")
+        wave_form = QFormLayout(self.wave_box)
+        wave_form.setContentsMargins(8, 6, 8, 6)
+        wave_form.setVerticalSpacing(3)
+        self.wave_cycles = QDoubleSpinBox()
+        self.wave_cycles.setRange(0.0, 12.0)
+        self.wave_cycles.setSingleStep(0.25)
+        self.wave_cycles.setValue(2.75)
+        wave_form.addRow("Carrier waves", self.wave_cycles)
+        self.wave_amplitude = QDoubleSpinBox()
+        self.wave_amplitude.setRange(0.0, 2.0)
+        self.wave_amplitude.setSingleStep(0.05)
+        self.wave_amplitude.setValue(0.45)
+        self.wave_amplitude.setSuffix(" × spacing")
+        wave_form.addRow("Wave amplitude", self.wave_amplitude)
+
         self.halftone_box = QGroupBox("Halftone")
         half_form = QFormLayout(self.halftone_box)
         half_form.setContentsMargins(8, 6, 8, 6)
@@ -1103,6 +1274,7 @@ class MainWindow(QMainWindow):
         pattern_tab_layout.setContentsMargins(2, 2, 2, 2)
         pattern_tab_layout.setSpacing(2)
         pattern_tab_layout.addWidget(self.lines_box)
+        pattern_tab_layout.addWidget(self.wave_box)
         pattern_tab_layout.addWidget(self.halftone_box)
         pattern_tab_layout.addWidget(self.spiral_box)
         pattern_tab_layout.addStretch(1)
@@ -1202,7 +1374,7 @@ class MainWindow(QMainWindow):
         layout.setStretch(0, 0)
         layout.setStretch(1, 1)
         root.setMaximumWidth(1125)
-        
+
         self.pattern.currentTextChanged.connect(self.update_pattern_controls)
         self.pattern.currentTextChanged.connect(self.apply_density_profile)
         self.pattern.currentTextChanged.connect(self.schedule)
@@ -1210,7 +1382,8 @@ class MainWindow(QMainWindow):
             self.density, self.strength, self.separation, self.contrast,
             self.zoom, self.pan_x, self.pan_y, self.rotation,
             self.line_smoothing, self.halftone_angle, self.halftone_min,
-            self.spiral_center_x, self.spiral_center_y, self.spiral_smoothing
+            self.spiral_center_x, self.spiral_center_y, self.spiral_smoothing,
+            self.wave_cycles, self.wave_amplitude
         ):
             widget.valueChanged.connect(self.schedule)
         self.output_size.valueChanged.connect(self.update_density_for_output_size)
@@ -1222,26 +1395,30 @@ class MainWindow(QMainWindow):
         self.apply_density_profile(self.pattern.currentText())
 
     def renderer_density_from_value(self, value: int, pattern: str | None = None) -> int:
-        """Convert the visible pattern parameter to the value expected by the renderer."""
         pattern = pattern or self.pattern.currentText()
         value = int(value)
 
-        if pattern in ("Vertical stripes", "Horizontal stripes", "Diagonal stripes"):
-                                                                     
+        if pattern in (
+            "Vertical stripes",
+            "Horizontal stripes",
+            "Diagonal stripes",
+            "Segmented scanlines",
+            "Wavy lines"
+        ):
+
             return max(1, value)
 
         if pattern in ("Halftone", "Hexagonal halftone"):
-                                                                                
+
             return max(1, value)
 
         if pattern == "Spiral stripes":
-                                                                              
+
             return max(1, round(216 / max(1, value)))
 
         return max(1, value)
 
     def renderer_density_value(self) -> int:
-        """Return the current visible parameter converted for the active renderer."""
         return self.renderer_density_from_value(
             self.density.value(),
             self.pattern.currentText()
@@ -1267,7 +1444,9 @@ class MainWindow(QMainWindow):
             spiral_center_x=self.spiral_center_x.value(),
             spiral_center_y=self.spiral_center_y.value(),
             spiral_clockwise=self.spiral_clockwise.isChecked(),
-            spiral_smoothing=self.spiral_smoothing.value()
+            spiral_smoothing=self.spiral_smoothing.value(),
+            wave_cycles=self.wave_cycles.value(),
+            wave_amplitude=self.wave_amplitude.value()
         )
 
     def scaled_pattern_value(self, base_value: int) -> int:
@@ -1278,7 +1457,6 @@ class MainWindow(QMainWindow):
         self.apply_density_profile(self.pattern.currentText())
 
     def apply_density_profile(self, pattern: str, preserve_relative: bool = False):
-        """Adapt the shared control to the real geometric parameter of each pattern."""
         profile = PATTERN_PARAMETER_PROFILES.get(
             pattern,
             PATTERN_PARAMETER_PROFILES["Vertical stripes"]
@@ -1344,7 +1522,16 @@ class MainWindow(QMainWindow):
 
     def update_pattern_controls(self):
         pattern = self.pattern.currentText()
-        self.lines_box.setVisible("stripes" in pattern.lower() and "spiral" not in pattern.lower())
+        self.lines_box.setVisible(
+            pattern in (
+                "Vertical stripes",
+                "Horizontal stripes",
+                "Diagonal stripes",
+                "Segmented scanlines",
+                "Wavy lines"
+            )
+        )
+        self.wave_box.setVisible(pattern == "Wavy lines")
         self.halftone_box.setVisible("halftone" in pattern.lower())
         self.spiral_box.setVisible("spiral" in pattern.lower())
 

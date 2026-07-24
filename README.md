@@ -6,13 +6,15 @@
 
 <p align="center"><strong>Perceptual pattern image generator</strong></p>
 
-Percepta is a desktop application that transforms an ordinary image into a structured RGB pattern made of coloured stripes, dots or a continuous spiral.
+Percepta is a desktop application that transforms an ordinary image into a structured RGB pattern made of coloured stripes, segmented scanlines, warped lines, dots or a continuous spiral.
 
 At close range, the geometric pattern is clearly visible. When the image is viewed from farther away — or displayed at a smaller size — the red, green and blue structures blend together and the original picture becomes recognisable again.
 
 ## Main features
 
 - Vertical, horizontal and diagonal RGB stripes
+- Segmented RGB scanlines made of discrete dashes
+- Parallel RGB lines warped by local image luminance
 - Square and hexagonal halftone patterns
 - Continuous RGB spiral rendering
 - Crop, zoom, pan and rotation controls
@@ -47,6 +49,10 @@ The source image is displayed in the centre of the window and the generated perc
 </tr>
 <tr>
 <td><img src="media/diagonal_stripes.png" alt="Diagonal stripes"><br><strong>Diagonal stripes</strong></td>
+<td><img src="media/segmented_scanlines.png" alt="Segmented scanlines"><br><strong>Segmented scanlines</strong></td>
+</tr>
+<tr>
+<td><img src="media/wavy_lines.png" alt="Wavy lines"><br><strong>Wavy lines</strong></td>
 <td><img src="media/halftone.png" alt="Halftone"><br><strong>Halftone</strong></td>
 </tr>
 <tr>
