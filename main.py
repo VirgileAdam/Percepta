@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-APP_VERSION = "0.33.0"
+APP_VERSION = "0.34.1"
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageOps
@@ -66,6 +66,8 @@ class Settings:
     spiral_smoothing: int = 6
     wave_cycles: float = 2.75
     wave_amplitude: float = 0.45
+    monochrome: bool = False
+    subjective_colour: str = "Red"
 
 
 class ImageView(QScrollArea):
@@ -76,39 +78,99 @@ class ImageView(QScrollArea):
             self.sizePolicy().Policy.Expanding,
             self.sizePolicy().Policy.Expanding
         )
-        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         self.label = QLabel(placeholder)
         self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.label.setStyleSheet("QLabel { background:#202124; color:#c8c8c8; }")
         self.setWidget(self.label)
-        self.setWidgetResizable(True)
+        self.setWidgetResizable(False)
         self._pixmap: Optional[QPixmap] = None
+        self._scale = 1.0
+        self._manual_zoom = False
 
-    def set_image(self, image: Image.Image):
+    def set_image(self, image: Image.Image, reset_zoom: bool = False):
         arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
         qimg = QImage(
             arr.data, arr.shape[1], arr.shape[0], arr.strides[0],
             QImage.Format.Format_RGB888
         ).copy()
         self._pixmap = QPixmap.fromImage(qimg)
-        self._fit()
+        if reset_zoom or not self._manual_zoom:
+            self.fit_to_window()
+        else:
+            self._apply_scale()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        self._fit()
+        if self._pixmap is not None and not self._manual_zoom:
+            self.fit_to_window()
 
-    def _fit(self):
+    def wheelEvent(self, event):
+        if self._pixmap is None:
+            super().wheelEvent(event)
+            return
+        if event.angleDelta().y() > 0:
+            self.zoom_in()
+        else:
+            self.zoom_out()
+        event.accept()
+
+    def mouseDoubleClickEvent(self, event):
+        if self._pixmap is not None:
+            self.fit_to_window()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+    def zoom_in(self):
+        self._set_scale(self._scale * 1.25)
+
+    def zoom_out(self):
+        self._set_scale(self._scale / 1.25)
+
+    def fit_to_window(self):
         if self._pixmap is None:
             return
-        side = max(1, min(self.viewport().width(), self.viewport().height()) - 6)
-        self.label.setPixmap(self._pixmap.scaled(
-            side,
-            side,
+        viewport_width = max(1, self.viewport().width() - 8)
+        viewport_height = max(1, self.viewport().height() - 8)
+        self._scale = min(
+            viewport_width / self._pixmap.width(),
+            viewport_height / self._pixmap.height()
+        )
+        self._scale = max(0.01, self._scale)
+        self._manual_zoom = False
+        self._apply_scale()
+
+    def actual_size(self):
+        if self._pixmap is None:
+            return
+        self._scale = 1.0
+        self._manual_zoom = True
+        self._apply_scale()
+
+    def _set_scale(self, scale: float):
+        if self._pixmap is None:
+            return
+        self._scale = max(0.02, min(12.0, scale))
+        self._manual_zoom = True
+        self._apply_scale()
+
+    def _apply_scale(self):
+        if self._pixmap is None:
+            return
+        width = max(1, int(round(self._pixmap.width() * self._scale)))
+        height = max(1, int(round(self._pixmap.height() * self._scale)))
+        scaled = self._pixmap.scaled(
+            width,
+            height,
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation
-        ))
+        )
+        self.label.setPixmap(scaled)
+        self.label.resize(scaled.size())
 
 
 def center_square(image: Image.Image) -> Image.Image:
@@ -190,6 +252,25 @@ def choose_pattern(image: Image.Image) -> str:
               + np.abs(np.diff(gray, axis=1)).mean())
     return "Halftone" if detail > 0.12 else "Vertical stripes"
 
+
+
+def render_subjective_colour_scanlines(image: Image.Image, settings: Settings) -> Image.Image:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    output = np.empty_like(array)
+    height = array.shape[0]
+    scanline_height = max(1, int(settings.density))
+    target_index = {"Red": 0, "Green": 1, "Blue": 2}.get(
+        settings.subjective_colour,
+        0
+    )
+    target = array[..., target_index]
+    grayscale = np.stack((target, target, target), axis=2)
+    complement = array.copy()
+    complement[..., target_index] = 0
+    rows = ((np.arange(height) // scanline_height) % 2) == 0
+    output[rows] = grayscale[rows]
+    output[~rows] = complement[~rows]
+    return Image.fromarray(output, "RGB")
 
 def render_axis_stripes(image: Image.Image, settings: Settings, horizontal: bool) -> Image.Image:
     source = image.transpose(Image.Transpose.ROTATE_90) if horizontal else image
@@ -698,25 +779,39 @@ def generate(image: Image.Image, settings: Settings) -> tuple[Image.Image, str]:
     prepared = prepare(image, settings)
     pattern = settings.pattern if settings.pattern else "Vertical stripes"
 
-    if pattern == "Vertical stripes":
-        result = render_axis_stripes(prepared, settings, horizontal=False)
-    elif pattern == "Horizontal stripes":
-        result = render_axis_stripes(prepared, settings, horizontal=True)
-    elif pattern == "Diagonal stripes":
-        result = render_diagonal_stripes(prepared, settings)
-    elif pattern == "Segmented scanlines":
-        result = render_segmented_scanlines(prepared, settings)
-    elif pattern == "Wavy lines":
-        result = render_wavy_lines(prepared, settings)
-    elif pattern == "Halftone":
-        result = render_halftone(prepared, settings, hexagonal=False)
-    elif pattern == "Hexagonal halftone":
-        result = render_halftone(prepared, settings, hexagonal=True)
-    elif pattern == "Spiral stripes":
-        result = render_spiral_halftone(prepared, settings)
-    else:
-        result = render_axis_stripes(prepared, settings, horizontal=False)
+    if pattern == "Subjective colour scanlines":
+        return render_subjective_colour_scanlines(prepared, settings), pattern
 
+    if settings.monochrome:
+        prepared = ImageOps.grayscale(prepared).convert("RGB")
+        render_settings = Settings(**{
+            **settings.__dict__,
+            "colour_separation": 0
+        })
+    else:
+        render_settings = settings
+
+    if pattern == "Vertical stripes":
+        result = render_axis_stripes(prepared, render_settings, horizontal=False)
+    elif pattern == "Horizontal stripes":
+        result = render_axis_stripes(prepared, render_settings, horizontal=True)
+    elif pattern == "Diagonal stripes":
+        result = render_diagonal_stripes(prepared, render_settings)
+    elif pattern == "Segmented scanlines":
+        result = render_segmented_scanlines(prepared, render_settings)
+    elif pattern == "Wavy lines":
+        result = render_wavy_lines(prepared, render_settings)
+    elif pattern == "Halftone":
+        result = render_halftone(prepared, render_settings, hexagonal=False)
+    elif pattern == "Hexagonal halftone":
+        result = render_halftone(prepared, render_settings, hexagonal=True)
+    elif pattern == "Spiral stripes":
+        result = render_spiral_halftone(prepared, render_settings)
+    else:
+        result = render_axis_stripes(prepared, render_settings, horizontal=False)
+
+    if settings.monochrome:
+        result = ImageOps.grayscale(result).convert("RGB")
     return result, pattern
 
 
@@ -802,6 +897,16 @@ PATTERN_PARAMETER_PROFILES = {
         "animation_start": 16,
         "animation_end": 46,
         "tooltip": "Total number of vertical RGB lines deformed by the source image."
+    },
+    "Subjective colour scanlines": {
+        "label": "Scanline height",
+        "minimum": 1,
+        "maximum": 32,
+        "default": 1,
+        "animation_start": 1,
+        "animation_end": 8,
+        "suffix": " px",
+        "tooltip": "Height of each alternating scanline block. One block encodes the selected channel in grayscale and the next removes that channel."
     },
     "Halftone": {
         "label": "Dot spacing",
@@ -1001,42 +1106,60 @@ class MainWindow(QMainWindow):
     def show_how_it_works(self):
         dialog = QDialog(self)
         dialog.setWindowTitle("How Percepta works")
-        dialog.resize(620, 470)
+        dialog.resize(650, 520)
 
         layout = QVBoxLayout(dialog)
         layout.setContentsMargins(12, 10, 12, 10)
         layout.setSpacing(8)
 
-        title = QLabel("<h2>How Percepta hides an image in a pattern</h2>")
+        title = QLabel("<h2>How Percepta encodes an image</h2>")
         title.setWordWrap(True)
         layout.addWidget(title)
 
         explanation = QLabel(
             """
-            <p><b>1. The image is analysed locally.</b><br>
-            Percepta looks at the brightness of the red, green and blue components
-            in every small area of the source image.</p>
+            <p>Percepta contains <b>two distinct perceptual approaches</b>.</p>
 
-            <p><b>2. Brightness is converted into geometry.</b><br>
-            Instead of drawing normal pixels, Percepta changes the width of stripes,
-            the height of segmented dashes, the displacement and thickness of wavy
-            lines, the size of dots, or the thickness of a spiral. Bright areas contain
-            more visible coloured material; dark areas contain less.</p>
+            <p><b>1. Geometric RGB patterns.</b><br>
+            Vertical, horizontal and diagonal stripes, segmented scanlines, wavy lines,
+            halftones and the spiral analyse the red, green and blue intensities locally.
+            These values control geometric properties such as line width, dash height,
+            wave displacement, dot size or spiral thickness.</p>
 
-            <p><b>3. The three colour channels are drawn separately.</b><br>
-            Red, green and blue versions of the same pattern are slightly displaced.
-            Where all three overlap, the result is white. Partial overlap produces
-            cyan, magenta, yellow and coloured fringes.</p>
+            <p><b>2. Separate RGB geometries.</b><br>
+            In colour output, red, green and blue versions of the geometry are drawn
+            independently and may be slightly displaced. Their overlaps create white,
+            cyan, magenta, yellow and coloured fringes. When the pattern is displayed
+            sufficiently small, or viewed from far enough away, fine structures are
+            spatially averaged and the source image becomes easier to recognise.</p>
 
-            <p><b>4. Distance reconstructs the picture.</b><br>
-            From close up, the eye distinguishes the individual dots or lines.
-            From farther away, these details become too small to resolve. The eye
-            averages them together, much like the pixels of a screen, and the original
-            image reappears.</p>
+            <p><b>3. Monochrome output for geometric patterns.</b><br>
+            The Monochrome output option converts the prepared source to luminance,
+            removes RGB separation and renders the same selected geometry as a single
+            white-on-black pattern. It is not available for Subjective colour scanlines,
+            which follows a different method.</p>
 
-            <p><b>In one sentence:</b><br>
-            Percepta preserves the average amount of red, green and blue light in each
-            area, but redistributes that light into a visible geometric pattern.</p>
+            <p><b>4. Subjective colour scanlines.</b><br>
+            This mode does not encode brightness into geometric width. It alternates two
+            horizontal scanline families. To simulate red, one family contains the red
+            channel as neutral grayscale: (R,R,R). The other contains the original green
+            and blue channels with red removed: (0,G,B). Green and blue simulations use
+            the equivalent channel permutations. A red source region therefore becomes
+            alternating neutral light/dark lines rather than red-coloured pixels, while
+            neighbouring neutral regions contain the complementary colour. This spatial
+            contrast can create a subjective impression of the removed colour.</p>
+
+            <p><b>5. Preview zoom is only an inspection tool.</b><br>
+            The -, 1:1, Fit and + buttons, the mouse wheel and the scrollbars change only
+            how the source or output preview is displayed. They do not modify the crop,
+            the generated pixels or the exported file. Use Crop zoom, Pan X and Pan Y in
+            the Framing tab when the source framing itself must change. Percepta has no
+            separate distance-simulation mode.</p>
+
+            <p><b>Important limitation.</b><br>
+            Subjective colour depends on scanline size, display sampling, viewing distance
+            and the observer. The selected colour is removed as a chromatic pixel colour,
+            but the strength of the illusion cannot be guaranteed on every display.</p>
             """
         )
         explanation.setWordWrap(True)
@@ -1052,17 +1175,9 @@ class MainWindow(QMainWindow):
         scroll.setWidget(content)
         layout.addWidget(scroll, 1)
 
-        hint = QLabel(
-            "<b>Tip:</b> reduce the preview size, step back, or slightly squint "
-            "to simulate the visual averaging."
-        )
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
-
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         buttons.rejected.connect(dialog.reject)
         layout.addWidget(buttons)
-
         dialog.exec()
 
     def build_ui(self):
@@ -1108,6 +1223,7 @@ class MainWindow(QMainWindow):
             "Diagonal stripes",
             "Segmented scanlines",
             "Wavy lines",
+            "Subjective colour scanlines",
             "Halftone",
             "Hexagonal halftone",
             "Spiral stripes"
@@ -1132,6 +1248,12 @@ class MainWindow(QMainWindow):
         self.separation.setValue(10)
         self.separation.setSuffix(" px")
         form.addRow("Colour separation", self.separation)
+
+        self.monochrome = QCheckBox("Monochrome output")
+        self.monochrome.setToolTip(
+            "Use the current perceptual geometry with a single white channel on black instead of separate red, green and blue channels."
+        )
+        form.addRow(self.monochrome)
 
         self.contrast = QDoubleSpinBox()
         self.contrast.setRange(0.30, 4.00)
@@ -1174,7 +1296,7 @@ class MainWindow(QMainWindow):
         self.zoom.setRange(1.0, 5.0)
         self.zoom.setSingleStep(0.05)
         self.zoom.setValue(1.0)
-        framing_form.addRow("Zoom", self.zoom)
+        framing_form.addRow("Crop zoom", self.zoom)
         self.pan_x = QSpinBox()
         self.pan_x.setRange(-100, 100)
         self.pan_x.setSuffix(" %")
@@ -1217,6 +1339,19 @@ class MainWindow(QMainWindow):
         self.wave_amplitude.setValue(0.45)
         self.wave_amplitude.setSuffix(" × spacing")
         wave_form.addRow("Wave amplitude", self.wave_amplitude)
+
+        self.subjective_box = QGroupBox("Subjective colour")
+        subjective_form = QFormLayout(self.subjective_box)
+        subjective_form.setContentsMargins(8, 6, 8, 6)
+        subjective_form.setVerticalSpacing(3)
+        self.subjective_colour = QComboBox()
+        self.subjective_colour.addItems(["Red", "Green", "Blue"])
+        subjective_form.addRow("Simulated colour", self.subjective_colour)
+        subjective_explanation = QLabel(
+            "Alternates the selected channel as grayscale with the two remaining channels."
+        )
+        subjective_explanation.setWordWrap(True)
+        subjective_form.addRow(subjective_explanation)
 
         self.halftone_box = QGroupBox("Halftone")
         half_form = QFormLayout(self.halftone_box)
@@ -1275,6 +1410,7 @@ class MainWindow(QMainWindow):
         pattern_tab_layout.setSpacing(2)
         pattern_tab_layout.addWidget(self.lines_box)
         pattern_tab_layout.addWidget(self.wave_box)
+        pattern_tab_layout.addWidget(self.subjective_box)
         pattern_tab_layout.addWidget(self.halftone_box)
         pattern_tab_layout.addWidget(self.spiral_box)
         pattern_tab_layout.addStretch(1)
@@ -1293,8 +1429,10 @@ class MainWindow(QMainWindow):
         images_row = QHBoxLayout()
         images_row.setContentsMargins(0, 0, 0, 0)
         images_row.setSpacing(6)
-        images_row.addWidget(self.original, 1)
-        images_row.addWidget(self.output, 1)
+        source_panel = self.make_preview_panel("Source image", self.original)
+        output_panel = self.make_preview_panel("Generated pattern", self.output)
+        images_row.addWidget(source_panel, 1)
+        images_row.addWidget(output_panel, 1)
         images_row.setStretch(0, 1)
         images_row.setStretch(1, 1)
         previews_outer.addLayout(images_row, 1)
@@ -1391,8 +1529,48 @@ class MainWindow(QMainWindow):
         self.crop_ratio.currentTextChanged.connect(self.schedule)
         self.halftone_shape.currentTextChanged.connect(self.schedule)
         self.spiral_clockwise.toggled.connect(self.schedule)
+        self.monochrome.toggled.connect(self.update_pattern_controls)
+        self.monochrome.toggled.connect(self.schedule)
+        self.subjective_colour.currentTextChanged.connect(self.schedule)
         self.update_pattern_controls()
         self.apply_density_profile(self.pattern.currentText())
+
+    def make_preview_panel(self, title: str, view: ImageView) -> QWidget:
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+        controls = QHBoxLayout()
+        controls.setContentsMargins(0, 0, 0, 0)
+        label = QLabel(title)
+        controls.addWidget(label)
+        controls.addStretch(1)
+        zoom_out = QPushButton("−")
+        zoom_out.setFixedWidth(30)
+        zoom_out.setToolTip("Zoom out")
+        zoom_out.clicked.connect(view.zoom_out)
+        controls.addWidget(zoom_out)
+        actual = QPushButton("1:1")
+        actual.setFixedWidth(38)
+        actual.setToolTip("Show at actual pixel size")
+        actual.clicked.connect(view.actual_size)
+        controls.addWidget(actual)
+        fit = QPushButton("Fit")
+        fit.setFixedWidth(38)
+        fit.setToolTip("Fit the image to the preview")
+        fit.clicked.connect(view.fit_to_window)
+        controls.addWidget(fit)
+        zoom_in = QPushButton("+")
+        zoom_in.setFixedWidth(30)
+        zoom_in.setToolTip("Zoom in")
+        zoom_in.clicked.connect(view.zoom_in)
+        controls.addWidget(zoom_in)
+        layout.addLayout(controls)
+        layout.addWidget(view, 1)
+        view.setToolTip(
+            "Use the mouse wheel to zoom. Scrollbars allow panning. Double-click to fit."
+        )
+        return panel
 
     def renderer_density_from_value(self, value: int, pattern: str | None = None) -> int:
         pattern = pattern or self.pattern.currentText()
@@ -1403,7 +1581,8 @@ class MainWindow(QMainWindow):
             "Horizontal stripes",
             "Diagonal stripes",
             "Segmented scanlines",
-            "Wavy lines"
+            "Wavy lines",
+            "Subjective colour scanlines"
         ):
 
             return max(1, value)
@@ -1446,7 +1625,9 @@ class MainWindow(QMainWindow):
             spiral_clockwise=self.spiral_clockwise.isChecked(),
             spiral_smoothing=self.spiral_smoothing.value(),
             wave_cycles=self.wave_cycles.value(),
-            wave_amplitude=self.wave_amplitude.value()
+            wave_amplitude=self.wave_amplitude.value(),
+            monochrome=self.monochrome.isChecked(),
+            subjective_colour=self.subjective_colour.currentText()
         )
 
     def scaled_pattern_value(self, base_value: int) -> int:
@@ -1532,6 +1713,10 @@ class MainWindow(QMainWindow):
             )
         )
         self.wave_box.setVisible(pattern == "Wavy lines")
+        self.subjective_box.setVisible(pattern == "Subjective colour scanlines")
+        subjective_mode = pattern == "Subjective colour scanlines"
+        self.monochrome.setEnabled(not subjective_mode)
+        self.separation.setEnabled(not subjective_mode and not self.monochrome.isChecked())
         self.halftone_box.setVisible("halftone" in pattern.lower())
         self.spiral_box.setVisible("spiral" in pattern.lower())
 
@@ -1566,12 +1751,15 @@ class MainWindow(QMainWindow):
             self.play_pause_button.setEnabled(False)
             self.stop_animation_button.setEnabled(False)
             self.file_label.setText(path.name)
-            self.original.set_image(framed_source(self.source, self.settings()))
-            self.regenerate()
+            self.original.set_image(
+                framed_source(self.source, self.settings()),
+                reset_zoom=True
+            )
+            self.regenerate(reset_output_zoom=True)
         except Exception as exc:
             QMessageBox.critical(self, "Unable to open image", str(exc))
 
-    def regenerate(self):
+    def regenerate(self, reset_output_zoom: bool = False):
         if self.source is None:
             return
 
@@ -1580,7 +1768,7 @@ class MainWindow(QMainWindow):
             current = self.settings()
             self.original.set_image(framed_source(self.source, current))
             self.result, used = generate(self.source, current)
-            self.output.set_image(self.result)
+            self.output.set_image(self.result, reset_zoom=reset_output_zoom)
             self.export_button.setEnabled(True)
             self.statusBar().showMessage(
                 f"Pattern: {used} — {self.result.width} × {self.result.height} px",
